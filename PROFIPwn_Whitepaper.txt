@@ -1,0 +1,260 @@
+================================================================================
+  PROFIPwn: An Offensive Security Framework for
+  PROFINET Industrial Ethernet
+================================================================================
+
+  Dr. Sapna V M
+  Associate Professor, Department of Computer Science
+  PES University, Bengaluru, India
+
+  Source: https://github.com/p17433308-cmyk/PROFIPwn
+
+--------------------------------------------------------------------------------
+ABSTRACT
+--------------------------------------------------------------------------------
+PROFINET is the most widely deployed industrial Ethernet protocol, connecting
+millions of PLCs, drives, IO modules, and switches from Siemens and hundreds of
+third-party vendors. Its Discovery and Configuration Protocol (DCP) operates on
+Layer 2 without authentication, encryption, or integrity protection: any device
+on the same Ethernet segment can discover, rename, re-address, or factory-reset
+any PROFINET device with a single frame. Its Real-Time (RT) cyclic data channel
+carries sensor and actuator values — motor speeds, valve positions, temperature
+readings — with no authentication or integrity check on the process data itself.
+Despite this attack surface, no known public offensive security tools have targeted
+PROFINET.
+
+We present PROFIPwn, the first open-source offensive security framework, to our knowledge, for
+PROFINET. PROFIPwn implements the DCP and RT wire formats in pure Python
+(standard library only), provides 10 attack modules spanning identity spoofing,
+IP manipulation, factory reset, process data injection, alarm flooding, and
+cycle counter desynchronization, includes a structure-aware protocol fuzzer with
+live crash detection over raw sockets, and offers a full packet dissection,
+pcap capture/replay, and traffic analysis suite. We describe the protocol attack
+surface, the framework architecture, each attack primitive and its operational
+impact, and an evaluation on a loopback testbed.
+
+--------------------------------------------------------------------------------
+1. INTRODUCTION
+--------------------------------------------------------------------------------
+Industrial Ethernet has replaced legacy fieldbuses (PROFIBUS, DeviceNet) as the
+backbone of modern automation. PROFINET, standardized in IEC 61158 / IEC 61784,
+dominates: over 50 million installed nodes worldwide, with every Siemens S7-1200,
+S7-1500, ET 200SP, SCALANCE switch, and SINAMICS drive speaking it natively.
+
+PROFINET operates at Layer 2 (EtherType 0x8892). DCP handles device discovery
+and configuration — station name assignment, IP address assignment, factory
+reset — entirely without authentication. RT carries cyclic process data between
+IO-Controllers (PLCs) and IO-Devices (remote IO, drives, sensors) at cycle times
+of 1–128 ms, with the Frame ID alone determining data routing. There is no MAC,
+no signature, no encryption on any of these frames.
+
+The security research community has studied PROFINET in theory, and commercial
+fuzzers (Synopsys Defensics) exist behind vendor NDAs, but no open, reproducible,
+offensive tool has been published. PROFIPwn fills that gap.
+
+Contributions:
+  * A complete, dependency-free implementation of the PROFINET DCP and RT wire
+    formats with symmetric build/parse paths.
+  * A DCP scanner with device fingerprinting (vendor ID, device ID, station
+    name, roles, IP) and a Siemens device identification table.
+  * Five DCP attack modules: identity spoofing, IP manipulation, factory reset,
+    name collision, and DCP flooding.
+  * Five RT attack modules: process data injection with correct cycle timing,
+    provider stop injection, data invalid injection, alarm flooding, and cycle
+    counter desynchronization.
+  * A structure-aware protocol fuzzer generating DCP and RT mutations, with
+    live network delivery over raw sockets and crash detection via DCP liveness
+    probing, plus pcap export and subprocess-based target fuzzing.
+  * A packet dissector, pcap reader/writer, live capture engine, and replay
+    tool with configurable speed and modification callbacks.
+
+--------------------------------------------------------------------------------
+2. BACKGROUND
+--------------------------------------------------------------------------------
+2.1 PROFINET DCP
+DCP frames use EtherType 0x8892. A DCP frame contains a 2-byte Frame ID
+(0xFEFE for Identify Request, 0xFEFF for Identify Response, 0xFEFD for
+Get/Set), a 1-byte Service ID (Get=3, Set=4, Identify=5, Hello=6), a 1-byte
+Service Type (Request=0, Response=1), a 4-byte transaction ID (XID), a 2-byte
+response delay, a 2-byte data length, and a variable number of DCP blocks.
+Each block has an option (IP=1, Device=2, Control=5) and suboption.
+
+DCP is completely unauthenticated. Any Ethernet frame with the correct
+EtherType and a valid DCP header is processed by every PROFINET device on the
+segment. Set operations (name change, IP change, factory reset) require no
+credential or challenge-response.
+
+2.2 PROFINET RT
+RT frames share EtherType 0x8892 with DCP. An RT frame contains a 2-byte
+Frame ID (0x8000–0xBFFF for RT Class 1), variable-length IO data (the actual
+process data: sensor values, actuator setpoints), a 2-byte cycle counter, a
+1-byte data status (encoding provider run/stop, data valid/invalid, primary/
+backup state), and a 1-byte transfer status.
+
+The IO-Controller accepts an RT frame if its Frame ID matches a configured
+communication relationship. There is no authentication — an attacker who knows
+(or guesses) the Frame ID can inject arbitrary process data that the PLC will
+act on.
+
+2.3 PROFINET Alarms
+Alarm frames use Frame IDs 0xFC01 (high priority) and 0xFE01 (low priority).
+PROFINET devices typically support 1–4 concurrent alarms. An alarm PDU carries
+the alarm type, API, slot/subslot, module/submodule identifiers, an alarm
+specifier, and alarm data.
+
+--------------------------------------------------------------------------------
+3. FRAMEWORK ARCHITECTURE
+--------------------------------------------------------------------------------
+PROFIPwn is organized as a protocol core, attack modules, a fuzzer, traffic
+analysis tools, and a CLI, all in pure Python (standard library only):
+
+  profipwn/
+    protocols/profinet_dcp.py    DCP build/parse (Identify, Set, Get, Signal)
+    protocols/profinet_rt.py     RT frames, alarms, cycle generation
+    discovery/scanner.py         DCP scanner + Siemens device fingerprinting
+    attacks/dcp_attacks.py       5 DCP attack modules
+    attacks/rt_attacks.py        5 RT attack modules
+    fuzzer.py                    Structure-aware fuzzer + live delivery + pcap
+    dissectors.py                Dissector + pcap + capture + replay
+    cli.py                       scan / attack / fuzz / capture / replay / decode / demo
+
+Dependencies: none for the core (pure stdlib). Scapy is an optional fallback
+for the scanner on systems without AF_PACKET. The tool runs unmodified on a
+diagnostic laptop or Raspberry Pi bridged onto an industrial Ethernet segment.
+
+--------------------------------------------------------------------------------
+4. ATTACK MODULES
+--------------------------------------------------------------------------------
+4.1 DCP Identity Spoofing
+Sends a DCP Set-Name request to a target MAC, changing its station name. Impact:
+PROFINET IO-Controllers connect to IO-Devices by station name. A renamed device
+is orphaned from its controller, causing all associated IO to fail. The name
+change can be made permanent (survives reboot) with a single flag.
+
+4.2 DCP IP Manipulation
+Sends a DCP Set-IP request. Impact: redirects traffic, creates address conflicts,
+or isolates the device. Setting IP to 0.0.0.0 disables IP communication while
+Layer 2 RT traffic continues — a stealthy selective disruption.
+
+4.3 DCP Factory Reset
+Sends a DCP Factory-Reset command. Impact: wipes all configuration including
+station name, IP, and PROFINET project assignment. The device becomes unreachable
+until manually reconfigured. In a production plant, this stops the process
+controlled by that device.
+
+4.4 DCP Name Collision
+Broadcasts DCP Set-Name requests setting multiple devices to the same station
+name. Impact: PROFINET requires unique names. Name collisions prevent the
+IO-Controller from connecting to either device, causing cascading IO failure.
+
+4.5 DCP Flood
+Sends rapid alternating DCP requests (Identify, Set-Name, Signal) to a target.
+Impact: PROFINET devices have limited DCP processing capacity. Flooding can
+cause missed RT cycles, watchdog timeouts, or device resets on resource-
+constrained PLCs.
+
+4.6 RT Process Data Injection
+Injects crafted RT frames with arbitrary IO data using correct cycle timing
+(RTCycleGenerator). Impact: directly manipulates the sensor/actuator values
+seen by the IO-Controller. The PLC accepts the frames if the Frame ID matches.
+
+4.7 RT Provider Stop Injection
+Injects RT frames with the Provider Stop data status flag. Impact: tells the
+IO-Controller that the IO-Device has stopped providing data. The controller
+transitions to substitute values or enters safe state, stopping the process.
+
+4.8 RT Data Invalid Injection
+Injects RT frames with the Data Invalid flag. Impact: the IO-Controller uses
+substitute (stale/default) values instead of live process data. More subtle
+than Provider Stop — the connection stays up but operates on wrong data.
+
+4.9 Alarm Flooding
+Sends hundreds of alarm frames with randomized slots, modules, and types.
+Impact: exhausts the alarm queue (typically 1–4 concurrent). Legitimate alarms
+are dropped, and resource-constrained devices may watchdog.
+
+4.10 Cycle Counter Desynchronization
+Injects RT frames with future cycle counter values. Impact: some implementations
+use the counter for ordering and duplicate detection. Frames from the legitimate
+provider are rejected as duplicates or out-of-order.
+
+--------------------------------------------------------------------------------
+5. PROTOCOL FUZZING
+--------------------------------------------------------------------------------
+The fuzzer generates structure-aware mutations for both DCP and RT:
+
+DCP mutations: invalid service IDs, oversized block data, all option/suboption
+combinations, corrupted block lengths, empty/minimal frames, XID boundary values,
+and random byte-level mutations on valid frames.
+
+RT mutations: invalid Frame IDs, oversized IO data, all 256 data status values,
+transfer status boundary values, and alarm type fuzzing.
+
+Cases can be:
+  (a) Saved as individual .bin files with a manifest for external fuzzing tools.
+  (b) Exported to pcap (Ethernet-framed) for Wireshark analysis or replay.
+  (c) Delivered live over raw sockets to a PROFINET target, with a DCP liveness
+      probe after each case to detect crashes (target stops responding to DCP
+      Identify = likely crash). The run stops on first crash so the triggering
+      case is unambiguous.
+  (d) Run against a target subprocess (e.g., a PROFINET stack binary), detecting
+      crashes (exit codes 134/139) and timeouts.
+
+--------------------------------------------------------------------------------
+6. TRAFFIC ANALYSIS
+--------------------------------------------------------------------------------
+The dissector decodes any Ethernet frame with EtherType 0x8892 into its PROFINET
+layers: DCP (service, type, XID, blocks with option/suboption and decoded
+fields), RT (Frame ID, IO data, cycle counter, data status with run/stop/valid/
+invalid interpretation), and Alarm (priority, data). The capture engine uses
+raw AF_PACKET sockets with optional Frame ID filtering. The replay engine
+supports configurable speed and an optional modification callback for in-flight
+frame manipulation.
+
+The decode CLI command accepts any PROFINET frame as hex and prints a Wireshark-
+style dissection.
+
+--------------------------------------------------------------------------------
+7. EVALUATION
+--------------------------------------------------------------------------------
+We validated PROFIPwn on a loopback testbed. The protocol layer round-trips
+all DCP build/parse operations and RT frame construction (verified by a test
+suite of 17 cases covering DCP structure, Ethernet framing, parse round-trips,
+RT frame construction, data status flags, provider stop flags, fuzz pcap export,
+dissection, and pcap read/write). The demo command exercises the full pipeline
+— DCP and RT packet construction, packet dissection, fuzz case generation, and
+pcap export — producing real wire-format output with no network required.
+
+--------------------------------------------------------------------------------
+8. RESPONSIBLE USE
+--------------------------------------------------------------------------------
+PROFIPwn is intended for authorized security testing only: owned test PLCs,
+bench setups, and sanctioned ICS penetration testing engagements. The demo
+command operates entirely offline. PROFINET devices control physical processes
+— motors, valves, pumps, robots — and unauthorized testing can cause physical
+damage, production downtime, or safety hazards. The DCP weaknesses PROFIPwn
+exercises are inherent to the published IEC 61158 specification, not any single
+vendor's defect.
+
+--------------------------------------------------------------------------------
+9. CONCLUSION
+--------------------------------------------------------------------------------
+PROFINET is the dominant industrial Ethernet protocol, yet zero public offensive
+security tools have targeted it. PROFIPwn provides the first open-source
+offensive framework: DCP and RT protocol implementations, 10 attack modules
+covering identity spoofing through cycle counter desynchronization, a structure-
+aware fuzzer with live crash detection, and a complete traffic analysis suite.
+It gives ICS security researchers and penetration testers a practical tool for
+assessing the PROFINET attack surface of industrial environments.
+
+--------------------------------------------------------------------------------
+REFERENCES (SELECTED)
+--------------------------------------------------------------------------------
+  [1] IEC 61158 — Industrial communication networks: Fieldbus specifications.
+  [2] IEC 61784 — Industrial communication networks: Profiles.
+  [3] Siemens PROFINET System Description (public documentation).
+  [4] PI International — PROFINET Security Guideline, Version 1.0 (2020).
+  [5] Klick et al., "Internet-facing PLCs — A New Back Orifice," Black Hat
+      USA 2015.
+
+================================================================================
